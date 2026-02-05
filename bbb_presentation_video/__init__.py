@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import argparse
+import os
 import sys
+import tempfile
 from fractions import Fraction
 from importlib.metadata import PackageNotFoundError, metadata
 from os import path
@@ -120,8 +122,28 @@ def main() -> None:
         help="ignore recording start/stop events and generate video for the entire meeting",
         default=False,
     )
+    parser.add_argument(
+        "-f",
+        "--format",
+        metavar="FORMAT",
+        type=str,
+        choices=["h264"],
+        help="output format using GPU encoding (h264 uses NVENC h264_nvenc encoder, output stored in temp file)",
+        default=None,
+    )
 
     args = parser.parse_args()
+
+    # When --format h264 is specified, use NVENC GPU encoder and write to a
+    # temp file unless the user explicitly provided an output path.
+    if args.format == "h264":
+        args.codec = Codec.H264_NVENC
+        if args.output == DEFAULT_OUTPUT:
+            tmpfd, args.output = tempfile.mkstemp(
+                suffix=".mp4", prefix="bbb-presentation-"
+            )
+            os.close(tmpfd)
+        print(f'GPU encoding enabled: using NVENC h264 encoder')
 
     try:
         bpv_metadata = metadata(__package__)

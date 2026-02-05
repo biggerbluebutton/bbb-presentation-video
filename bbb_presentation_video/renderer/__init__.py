@@ -25,6 +25,7 @@ DRAWING_BG = Color.from_int(0xE2E8ED)
 
 class Codec(Enum):
     H264 = "h264"
+    H264_NVENC = "h264_nvenc"
     VP9 = "vp9"
     RAW_VIDEO = "rawvideo"
 
@@ -73,6 +74,19 @@ class Encoder:
     def output_ffmpeg(self) -> None:
         if self.codec == Codec.H264:
             codec_opts = ["-c:v", "libx264", "-qp", "0", "-preset", "ultrafast"]
+        elif self.codec == Codec.H264_NVENC:
+            codec_opts = [
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p4",
+                "-rc",
+                "constqp",
+                "-qp",
+                "20",
+                "-b:v",
+                "0",
+            ]
         elif self.codec == Codec.VP9:
             codec_opts = [
                 "-c:v",
@@ -86,6 +100,13 @@ class Encoder:
                 "-row-mt",
                 "1",
             ]
+
+        # Use mp4 container for NVENC h264 output, matroska for everything else
+        if self.codec == Codec.H264_NVENC:
+            container_fmt = "mp4"
+        else:
+            container_fmt = "matroska"
+
         # Launch the video encoder
         # Note that the hardcoded 'bgr0' here is only applicable in
         # little-endian!
@@ -115,7 +136,7 @@ class Encoder:
             "-g",
             str(round(self.framerate) * 10),
             "-f",
-            "matroska",
+            container_fmt,
             self.output,
         ]
 
