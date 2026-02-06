@@ -25,7 +25,7 @@ DRAWING_BG = Color.from_int(0xE2E8ED)
 
 class Codec(Enum):
     H264 = "h264"
-    H264_NVENC = "h264_nvenc"
+    H264_MP4 = "h264_mp4"
     VP9 = "vp9"
     RAW_VIDEO = "rawvideo"
 
@@ -74,18 +74,14 @@ class Encoder:
     def output_ffmpeg(self) -> None:
         if self.codec == Codec.H264:
             codec_opts = ["-c:v", "libx264", "-qp", "0", "-preset", "ultrafast"]
-        elif self.codec == Codec.H264_NVENC:
+        elif self.codec == Codec.H264_MP4:
             codec_opts = [
                 "-c:v",
-                "h264_nvenc",
+                "libx264",
                 "-preset",
-                "p4",
-                "-rc",
-                "constqp",
-                "-qp",
+                "medium",
+                "-crf",
                 "20",
-                "-b:v",
-                "0",
             ]
         elif self.codec == Codec.VP9:
             codec_opts = [
@@ -101,8 +97,8 @@ class Encoder:
                 "1",
             ]
 
-        # Use mp4 container for NVENC h264 output, matroska for everything else
-        if self.codec == Codec.H264_NVENC:
+        # Use mp4 container for h264_mp4 output, matroska for everything else
+        if self.codec == Codec.H264_MP4:
             container_fmt = "mp4"
         else:
             container_fmt = "matroska"

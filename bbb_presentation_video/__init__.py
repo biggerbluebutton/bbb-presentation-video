@@ -128,22 +128,22 @@ def main() -> None:
         metavar="FORMAT",
         type=str,
         choices=["h264"],
-        help="output format using GPU encoding (h264 uses NVENC h264_nvenc encoder, output stored in temp file)",
+        help="output format (h264 outputs h264/mp4 to temp file)",
         default=None,
     )
 
     args = parser.parse_args()
 
-    # When --format h264 is specified, use NVENC GPU encoder and write to a
+    # When --format h264 is specified, use h264/mp4 output and write to a
     # temp file unless the user explicitly provided an output path.
     if args.format == "h264":
-        args.codec = Codec.H264_NVENC
+        args.codec = Codec.H264_MP4
         if args.output == DEFAULT_OUTPUT:
             tmpfd, args.output = tempfile.mkstemp(
                 suffix=".mp4", prefix="bbb-presentation-"
             )
             os.close(tmpfd)
-        print(f'GPU encoding enabled: using NVENC h264 encoder')
+        print(f'Using h264/mp4 format')
 
     try:
         bpv_metadata = metadata(__package__)
