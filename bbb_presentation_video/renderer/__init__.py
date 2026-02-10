@@ -6,7 +6,7 @@ import threading
 import time
 from enum import Enum
 from fractions import Fraction
-from queue import Queue
+from queue import Empty, Queue
 from subprocess import PIPE, CalledProcessError, Popen
 from typing import Optional, cast
 
@@ -30,6 +30,12 @@ class Codec(Enum):
     RAW_VIDEO = "rawvideo"
 
 
+class EncoderError(Exception):
+    """Raised when the encoder thread encounters an error."""
+
+    pass
+
+
 class Encoder:
     queue: "Queue[Optional[bytearray]]"
     ret_queue: "Queue[bytearray]"
@@ -48,19 +54,63 @@ class Encoder:
         for x in range(0, 3):
             self.ret_queue.put(bytearray(width * height * 4))
 
+        # Track encoder thread errors so the main thread can detect them
+        self.error: Optional[BaseException] = None
+        self.ffmpeg_process: Optional[Popen] = None
+
         self.thread = threading.Thread(target=self.run)
         self.thread.daemon = True
         self.thread.start()
 
     def put(self, data: bytearray) -> None:
-        buf = self.ret_queue.get()
+        # Use a timeout loop so we can detect if the encoder thread has died.
+        # Without this, a dead encoder thread causes ret_queue.get() to block
+        # forever since buffers are never returned.
+        while True:
+            if self.error is not None:
+                raise EncoderError(
+                    f"Encoder thread failed: {self.error}"
+                ) from self.error
+            if not self.thread.is_alive():
+                raise EncoderError(
+                    "Encoder thread exited unexpectedly"
+                    + (f": {self.error}" if self.error else "")
+                )
+            try:
+                buf = self.ret_queue.get(timeout=2)
+                break
+            except Empty:
+                continue
         buf[:] = data
         self.queue.put(buf)
 
     def join(self) -> None:
-        # This is a sentinal value to tell the writing thread to exit
+        # This is a sentinel value to tell the writing thread to exit
         self.queue.put(None)
-        self.thread.join()
+        self.thread.join(timeout=120)
+        if self.thread.is_alive():
+            print("WARNING: Encoder thread did not exit within timeout, killing ffmpeg")
+            self._kill_ffmpeg()
+            self.thread.join(timeout=10)
+        if self.error is not None:
+            raise EncoderError(
+                f"Encoder thread failed: {self.error}"
+            ) from self.error
+
+    def cancel(self) -> None:
+        """Cancel encoding: drain queues, signal thread to stop, kill ffmpeg."""
+        # Send sentinel to unblock the encoder thread's queue.get()
+        self.queue.put(None)
+        self._kill_ffmpeg()
+        self.thread.join(timeout=10)
+
+    def _kill_ffmpeg(self) -> None:
+        """Forcefully terminate the ffmpeg process if it's running."""
+        if self.ffmpeg_process is not None:
+            try:
+                self.ffmpeg_process.kill()
+            except OSError:
+                pass
 
     def output_raw(self) -> None:
         with open(self.output, "wb") as f:
@@ -137,29 +187,48 @@ class Encoder:
         ]
 
         ffmpeg = Popen(ffmpeg_cmdline, stdin=PIPE, stdout=PIPE, close_fds=True)
+        self.ffmpeg_process = ffmpeg
         assert ffmpeg.stdout is not None and ffmpeg.stdin is not None
         ffmpeg.stdout.close()
 
-        while True:
-            buf = self.queue.get()
-            if buf is None:
-                break
+        try:
+            while True:
+                buf = self.queue.get()
+                if buf is None:
+                    break
 
-            ffmpeg.stdin.write(buf)
+                ffmpeg.stdin.write(buf)
 
-            self.ret_queue.put(buf)
+                self.ret_queue.put(buf)
+        except BrokenPipeError:
+            # ffmpeg process died; drain remaining items from queue so the
+            # main thread's put() calls don't block indefinitely.
+            while True:
+                buf = self.queue.get()
+                if buf is None:
+                    break
+                self.ret_queue.put(buf)
+            raise
+        finally:
+            try:
+                ffmpeg.stdin.close()
+            except BrokenPipeError:
+                pass
 
-        ffmpeg.stdin.close()
-        ffmpeg.wait()
+        ffmpeg.wait(timeout=120)
 
         if ffmpeg.returncode != 0:
             raise CalledProcessError(returncode=ffmpeg.returncode, cmd=ffmpeg_cmdline)
 
     def run(self) -> None:
-        if self.codec == Codec.RAW_VIDEO:
-            self.output_raw()
-        else:
-            self.output_ffmpeg()
+        try:
+            if self.codec == Codec.RAW_VIDEO:
+                self.output_raw()
+            else:
+                self.output_ffmpeg()
+        except Exception as e:
+            self.error = e
+            print(f"ERROR: Encoder thread failed: {e}")
 
 
 class Renderer:
@@ -268,129 +337,140 @@ class Renderer:
             self.output, self.width, self.height, self.framerate, self.codec
         )
 
-        presentation_changed = True
-        shapes_changed = False
-        cursor_changed = False
-        recording_changed = False
-        while self.pts < self.length:
-            event_ts = Fraction(0)
-            while True:
-                if len(self.events.events) == 0:
-                    break
+        try:
+            presentation_changed = True
+            shapes_changed = False
+            cursor_changed = False
+            recording_changed = False
+            while self.pts < self.length:
+                event_ts = Fraction(0)
+                while True:
+                    if len(self.events.events) == 0:
+                        break
 
-                event = self.events.events[0]
-                event_ts = event["timestamp"]
-                if event_ts > self.pts:
-                    break
+                    event = self.events.events[0]
+                    event_ts = event["timestamp"]
+                    if event_ts > self.pts:
+                        break
 
-                self.events.events.popleft()
+                    self.events.events.popleft()
 
-                name = event["name"]
-                print(f"{float(event['timestamp']):012.6f} {event['name']}")
+                    name = event["name"]
+                    print(f"{float(event['timestamp']):012.6f} {event['name']}")
 
-                # Skip events that are for a different pod
-                if name in ["pan_zoom", "presentation", "slide", "presenter"]:
-                    pod_event = cast(PerPodEvent, event)
-                    if pod_event["pod_id"] != self.pod_id:
-                        print(f"\tskipping event for pod {pod_event['pod_id']}")
-                        continue
+                    # Skip events that are for a different pod
+                    if name in ["pan_zoom", "presentation", "slide", "presenter"]:
+                        pod_event = cast(PerPodEvent, event)
+                        if pod_event["pod_id"] != self.pod_id:
+                            print(f"\tskipping event for pod {pod_event['pod_id']}")
+                            continue
 
-                tldraw.update(event)
+                    tldraw.update(event)
 
-                if name == "cursor":
-                    cursor.update_cursor(cast(events.CursorEvent, event))
-                elif name == "cursor_v2":
-                    cursor.update_cursor_v2(cast(events.WhiteboardCursorEvent, event))
-                elif name == "pan_zoom":
-                    presentation.update_pan_zoom(cast(events.PanZoomEvent, event))
-                elif name == "presentation":
-                    presentation_event = cast(events.PresentationEvent, event)
-                    presentation.update_presentation(presentation_event)
-                    shapes.update_presentation(presentation_event)
-                    cursor.update_presentation(presentation_event)
-                elif name == "slide":
-                    slide_event = cast(events.SlideEvent, event)
-                    presentation.update_slide(slide_event)
-                    shapes.update_slide(slide_event)
-                    cursor.update_slide(slide_event)
-                elif name == "shape":
-                    shape_event = cast(events.ShapeEvent, event)
-                    shapes.update_shape(shape_event)
-                    cursor.update_shape(shape_event)
-                elif name == "undo":
-                    shapes.update_undo(cast(events.UndoEvent, event))
-                elif name == "clear":
-                    shapes.update_clear(cast(events.ClearEvent, event))
-                elif name == "record":
-                    if self.update_record(cast(events.RecordEvent, event)):
+                    if name == "cursor":
+                        cursor.update_cursor(cast(events.CursorEvent, event))
+                    elif name == "cursor_v2":
+                        cursor.update_cursor_v2(
+                            cast(events.WhiteboardCursorEvent, event)
+                        )
+                    elif name == "pan_zoom":
+                        presentation.update_pan_zoom(cast(events.PanZoomEvent, event))
+                    elif name == "presentation":
+                        presentation_event = cast(events.PresentationEvent, event)
+                        presentation.update_presentation(presentation_event)
+                        shapes.update_presentation(presentation_event)
+                        cursor.update_presentation(presentation_event)
+                    elif name == "slide":
+                        slide_event = cast(events.SlideEvent, event)
+                        presentation.update_slide(slide_event)
+                        shapes.update_slide(slide_event)
+                        cursor.update_slide(slide_event)
+                    elif name == "shape":
+                        shape_event = cast(events.ShapeEvent, event)
+                        shapes.update_shape(shape_event)
+                        cursor.update_shape(shape_event)
+                    elif name == "undo":
+                        shapes.update_undo(cast(events.UndoEvent, event))
+                    elif name == "clear":
+                        shapes.update_clear(cast(events.ClearEvent, event))
+                    elif name == "record":
+                        if self.update_record(cast(events.RecordEvent, event)):
+                            recording_changed = True
+                    elif name == "presenter":
+                        cursor.update_presenter(cast(events.PresenterEvent, event))
+                    elif name == "join":
+                        cursor.update_join(cast(events.JoinEvent, event))
+                    elif name == "left":
+                        cursor.update_left(cast(events.LeftEvent, event))
+                    elif (
+                        name == "tldraw.add_shape"
+                        or name == "tldraw.delete_shape"
+                        or name == "tldraw.camera"
+                    ):
+                        pass
+                    else:
+                        print("\tdon't know how to handle this event")
+
+                if self.recording and self.pts >= self.start_time:
+                    start_time = time.perf_counter_ns()
+
+                    presentation_changed = presentation.finalize_frame()
+                    shapes_changed = shapes.finalize_frame(presentation.transform)
+                    tldraw_changed = tldraw.finalize_frame(presentation.transform)
+                    cursor_changed = cursor.finalize_frame(presentation.transform)
+
+                    if (
+                        presentation_changed
+                        or shapes_changed
+                        or tldraw_changed
+                        or cursor_changed
+                    ):
+                        # Composite the frame
+
+                        # Base background color
+                        ctx = self.ctx
+                        ctx.save()
+                        ctx.set_source_rgb(*DRAWING_BG)
+                        ctx.paint()
+                        ctx.restore()
+
+                        # Presentation
+                        presentation.render()
+
+                        # Shapes
+                        shapes.render()
+                        tldraw.render()
+
+                        # Cursor
+                        cursor.render()
+
                         recording_changed = True
-                elif name == "presenter":
-                    cursor.update_presenter(cast(events.PresenterEvent, event))
-                elif name == "join":
-                    cursor.update_join(cast(events.JoinEvent, event))
-                elif name == "left":
-                    cursor.update_left(cast(events.LeftEvent, event))
-                elif (
-                    name == "tldraw.add_shape"
-                    or name == "tldraw.delete_shape"
-                    or name == "tldraw.camera"
-                ):
-                    pass
-                else:
-                    print("\tdon't know how to handle this event")
 
-            if self.recording and self.pts >= self.start_time:
-                start_time = time.perf_counter_ns()
+                    self.surface.flush()
 
-                presentation_changed = presentation.finalize_frame()
-                shapes_changed = shapes.finalize_frame(presentation.transform)
-                tldraw_changed = tldraw.finalize_frame(presentation.transform)
-                cursor_changed = cursor.finalize_frame(presentation.transform)
+                    if recording_changed:
+                        end_time = time.perf_counter_ns()
+                        print(
+                            f"-- {float(self.pts):012.6f} frame {self.frame} ({(end_time - start_time) / 1000000:.3f}ms)"
+                        )
 
-                if (
-                    presentation_changed
-                    or shapes_changed
-                    or tldraw_changed
-                    or cursor_changed
-                ):
-                    # Composite the frame
+                    # Output a frame
+                    encoder.put(bytearray(self.surface.get_data()))
 
-                    # Base background color
-                    ctx = self.ctx
-                    ctx.save()
-                    ctx.set_source_rgb(*DRAWING_BG)
-                    ctx.paint()
-                    ctx.restore()
+                    presentation_changed = False
+                    shapes_changed = False
+                    cursor_changed = False
+                    recording_changed = False
 
-                    # Presentation
-                    presentation.render()
+                self.frame += 1
+                self.pts += self.framestep
 
-                    # Shapes
-                    shapes.render()
-                    tldraw.render()
-
-                    # Cursor
-                    cursor.render()
-
-                    recording_changed = True
-
-                self.surface.flush()
-
-                if recording_changed:
-                    end_time = time.perf_counter_ns()
-                    print(
-                        f"-- {float(self.pts):012.6f} frame {self.frame} ({(end_time - start_time) / 1000000:.3f}ms)"
-                    )
-
-                # Output a frame
-                encoder.put(bytearray(self.surface.get_data()))
-
-                presentation_changed = False
-                shapes_changed = False
-                cursor_changed = False
-                recording_changed = False
-
-            self.frame += 1
-            self.pts += self.framestep
-
-        encoder.join()
+            encoder.join()
+        except EncoderError:
+            # Encoder already failed; re-raise without trying to join again
+            raise
+        except BaseException:
+            # Ensure ffmpeg process is killed and encoder thread is stopped
+            # on any exception (rendering error, KeyboardInterrupt, etc.)
+            encoder.cancel()
+            raise
