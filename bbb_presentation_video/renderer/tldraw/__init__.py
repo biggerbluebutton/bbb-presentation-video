@@ -37,6 +37,9 @@ from bbb_presentation_video.renderer.tldraw.geo.oval_geo_shape import finalize_o
 from bbb_presentation_video.renderer.tldraw.geo.rectangle_geo_shape import (
     finalize_geo_rectangle,
 )
+from bbb_presentation_video.renderer.tldraw.geo.rhombus2_geo_shape import (
+    finalize_rhombus2,
+)
 from bbb_presentation_video.renderer.tldraw.geo.rhombus_geo_shape import (
     finalize_rhombus,
 )
@@ -67,6 +70,7 @@ from bbb_presentation_video.renderer.tldraw.shape import (
     PollShape,
     RectangleGeoShape,
     RectangleShape,
+    Rhombus2GeoShape,
     RhombusGeoShape,
     Shape,
     StarGeoShape,
@@ -324,6 +328,8 @@ class TldrawRenderer(Generic[CairoSomeSurface]):
                 finalize_rectangle(ctx, id, shape)
             elif isinstance(shape, RectangleGeoShape):
                 finalize_geo_rectangle(ctx, id, shape)
+            elif isinstance(shape, Rhombus2GeoShape):
+                finalize_rhombus2(ctx, id, shape)
             elif isinstance(shape, RhombusGeoShape):
                 finalize_rhombus(ctx, id, shape)
             elif isinstance(shape, StarGeoShape):
