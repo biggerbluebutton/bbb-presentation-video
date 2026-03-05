@@ -2,13 +2,17 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import os
+import shutil
+import struct
+import tempfile
 import threading
 import time
 from enum import Enum
 from fractions import Fraction
 from queue import Empty, Queue
 from subprocess import PIPE, CalledProcessError, Popen
-from typing import Optional, cast
+from typing import List, Optional, Tuple, cast
 
 import cairo
 
@@ -231,6 +235,185 @@ class Encoder:
             print(f"ERROR: Encoder thread failed: {e}")
 
 
+def _write_bmp(filepath: str, data: bytearray, width: int, height: int) -> None:
+    """Write raw BGRX pixel data as a BMP file.
+
+    Cairo FORMAT_RGB24 stores pixels as 32-bit BGRX (little-endian), which maps
+    directly to BMP's 32-bit BGR format with a top-down orientation.
+    """
+    pixel_data_size = width * height * 4
+    file_size = 14 + 40 + pixel_data_size  # BMP header + DIB header + pixels
+
+    with open(filepath, "wb") as f:
+        # BMP file header (14 bytes)
+        f.write(b"BM")
+        f.write(struct.pack("<I", file_size))  # File size
+        f.write(struct.pack("<HH", 0, 0))  # Reserved
+        f.write(struct.pack("<I", 14 + 40))  # Pixel data offset
+
+        # DIB header - BITMAPINFOHEADER (40 bytes)
+        f.write(struct.pack("<I", 40))  # Header size
+        f.write(struct.pack("<i", width))  # Width
+        f.write(struct.pack("<i", -height))  # Height (negative = top-down)
+        f.write(struct.pack("<HH", 1, 32))  # Planes, bits per pixel
+        f.write(struct.pack("<I", 0))  # Compression (BI_RGB)
+        f.write(struct.pack("<I", pixel_data_size))  # Image size
+        f.write(struct.pack("<ii", 2835, 2835))  # Resolution (72 DPI)
+        f.write(struct.pack("<II", 0, 0))  # Colors used, important colors
+
+        # Pixel data (BGRX from Cairo, direct write)
+        f.write(data[:pixel_data_size])
+
+
+class ConcatEncoder:
+    """Encodes video by saving unique frames to temp files and using ffmpeg's
+    concat demuxer. This avoids piping hundreds of GB of redundant raw video
+    data to ffmpeg for mostly-static presentations."""
+
+    def __init__(
+        self, output: str, width: int, height: int, framerate: Fraction, codec: Codec
+    ):
+        self.output = output
+        self.width = width
+        self.height = height
+        self.framerate = framerate
+        self.codec = codec
+        self.tmpdir = tempfile.mkdtemp(prefix="bbb-video-")
+        self.segments: List[Tuple[str, int]] = []  # (filepath, frame_count)
+        self.segment_index = 0
+        self.current_segment_file: Optional[str] = None
+        self.current_segment_frames = 0
+
+    def put(self, data: bytearray) -> None:
+        """Save a new unique frame. Finalizes the previous segment's duration."""
+        # Finalize previous segment
+        if self.current_segment_file is not None and self.current_segment_frames > 0:
+            self.segments.append(
+                (self.current_segment_file, self.current_segment_frames)
+            )
+
+        # Save new frame as BMP
+        self.segment_index += 1
+        filename = os.path.join(
+            self.tmpdir, f"frame_{self.segment_index:06d}.bmp"
+        )
+        _write_bmp(filename, data, self.width, self.height)
+        self.current_segment_file = filename
+        self.current_segment_frames = 1
+
+    def hold(self) -> None:
+        """Extend the current segment by one frame (content unchanged)."""
+        self.current_segment_frames += 1
+
+    def join(self) -> None:
+        """Finalize all segments and run ffmpeg with concat demuxer."""
+        # Finalize the last segment
+        if self.current_segment_file is not None and self.current_segment_frames > 0:
+            self.segments.append(
+                (self.current_segment_file, self.current_segment_frames)
+            )
+            self.current_segment_file = None
+
+        if not self.segments:
+            print("WARNING: No frames were captured, nothing to encode")
+            self._cleanup()
+            return
+
+        total_unique = len(self.segments)
+        total_frames = sum(count for _, count in self.segments)
+        print(
+            f"ConcatEncoder: {total_unique} unique frames out of "
+            f"{total_frames} total ({100 * total_unique / max(total_frames, 1):.1f}%)"
+        )
+
+        try:
+            self._encode()
+        finally:
+            self._cleanup()
+
+    def cancel(self) -> None:
+        """Clean up temp files on cancellation."""
+        self._cleanup()
+
+    def _encode(self) -> None:
+        """Write concat file and run ffmpeg."""
+        concat_file = os.path.join(self.tmpdir, "concat.txt")
+        framerate_float = float(self.framerate)
+
+        with open(concat_file, "w") as f:
+            f.write("ffconcat version 1.0\n")
+            for filepath, frame_count in self.segments:
+                duration = frame_count / framerate_float
+                f.write(f"file '{os.path.basename(filepath)}'\n")
+                f.write(f"duration {duration:.6f}\n")
+            # Repeat last file to avoid concat demuxer cutting it short
+            if self.segments:
+                f.write(f"file '{os.path.basename(self.segments[-1][0])}'\n")
+
+        # Build codec options
+        if self.codec == Codec.H264:
+            codec_opts = ["-c:v", "libx264", "-qp", "0", "-preset", "ultrafast"]
+        elif self.codec == Codec.H264_MP4:
+            codec_opts = [
+                "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            ]
+        elif self.codec == Codec.VP9:
+            codec_opts = [
+                "-c:v", "libvpx-vp9", "-deadline", "realtime",
+                "-cpu-used", "8", "-lossless", "1", "-row-mt", "1",
+            ]
+        else:
+            raise ValueError(f"Unsupported codec for ConcatEncoder: {self.codec}")
+
+        if self.codec == Codec.H264_MP4:
+            container_fmt = "mp4"
+        else:
+            container_fmt = "matroska"
+
+        ffmpeg_cmdline = [
+            "ffmpeg",
+            "-y",
+            "-nostats",
+            "-v", "warning",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", concat_file,
+            "-pix_fmt", "yuv420p",
+            "-r", str(self.framerate),
+            *codec_opts,
+            "-threads", "2",
+            "-g", str(round(self.framerate) * 10),
+            "-f", container_fmt,
+            self.output,
+        ]
+
+        print(f"ConcatEncoder: running ffmpeg with concat demuxer...")
+        ffmpeg = Popen(ffmpeg_cmdline, stdout=PIPE, close_fds=True)
+        try:
+            if ffmpeg.stdout is not None:
+                ffmpeg.stdout.close()
+            ffmpeg.wait(timeout=600)
+        except Exception:
+            try:
+                ffmpeg.kill()
+            except OSError:
+                pass
+            raise
+
+        if ffmpeg.returncode != 0:
+            raise CalledProcessError(
+                returncode=ffmpeg.returncode, cmd=ffmpeg_cmdline
+            )
+        print("ConcatEncoder: encoding complete")
+
+    def _cleanup(self) -> None:
+        """Remove temporary directory and all frame files."""
+        try:
+            shutil.rmtree(self.tmpdir, ignore_errors=True)
+        except Exception as e:
+            print(f"WARNING: Failed to clean up temp directory {self.tmpdir}: {e}")
+
+
 class Renderer:
     events: EventsInfo
     start_time: Fraction = Fraction(0)
@@ -333,9 +516,18 @@ class Renderer:
             self.ctx, presentation.transform, self.events.bbb_version
         )
 
-        encoder = Encoder(
-            self.output, self.width, self.height, self.framerate, self.codec
-        )
+        # Use ConcatEncoder for encoded output (dramatically reduces ffmpeg work
+        # by only encoding unique frames), fall back to pipe-based Encoder for
+        # raw video output which needs every frame.
+        use_concat = self.codec != Codec.RAW_VIDEO
+        if use_concat:
+            encoder = ConcatEncoder(
+                self.output, self.width, self.height, self.framerate, self.codec
+            )
+        else:
+            encoder = Encoder(
+                self.output, self.width, self.height, self.framerate, self.codec
+            )
 
         try:
             presentation_changed = True
@@ -454,8 +646,17 @@ class Renderer:
                             f"-- {float(self.pts):012.6f} frame {self.frame} ({(end_time - start_time) / 1000000:.3f}ms)"
                         )
 
-                    # Output a frame
-                    encoder.put(bytearray(self.surface.get_data()))
+                    if use_concat:
+                        # ConcatEncoder: only save frames when content changed,
+                        # otherwise just extend the current segment duration
+                        concat_enc = cast(ConcatEncoder, encoder)
+                        if recording_changed:
+                            concat_enc.put(bytearray(self.surface.get_data()))
+                        else:
+                            concat_enc.hold()
+                    else:
+                        # Pipe-based Encoder: send every frame
+                        encoder.put(bytearray(self.surface.get_data()))
 
                     presentation_changed = False
                     shapes_changed = False
