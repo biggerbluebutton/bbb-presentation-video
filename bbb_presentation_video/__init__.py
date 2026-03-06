@@ -131,12 +131,28 @@ def main() -> None:
         help="output format (h264 outputs h264/mp4 to temp file)",
         default=None,
     )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="use NVIDIA GPU encoding (h264_nvenc) instead of CPU",
+        default=False,
+    )
 
     args = parser.parse_args()
 
+    # GPU flag overrides codec to h264_nvenc and uses mp4 container
+    if args.gpu:
+        args.codec = Codec.H264_NVENC
+        if args.output == DEFAULT_OUTPUT:
+            tmpfd, args.output = tempfile.mkstemp(
+                suffix=".mp4", prefix="bbb-presentation-"
+            )
+            os.close(tmpfd)
+        print("Using NVIDIA GPU encoding (h264_nvenc)")
+
     # When --format h264 is specified, use h264/mp4 output and write to a
     # temp file unless the user explicitly provided an output path.
-    if args.format == "h264":
+    elif args.format == "h264":
         args.codec = Codec.H264_MP4
         if args.output == DEFAULT_OUTPUT:
             tmpfd, args.output = tempfile.mkstemp(
