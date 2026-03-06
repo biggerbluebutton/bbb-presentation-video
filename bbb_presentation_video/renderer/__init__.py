@@ -379,6 +379,7 @@ class ConcatEncoder:
             "-safe", "0",
             "-i", concat_file,
             "-pix_fmt", "yuv420p",
+            "-vsync", "cfr",
             "-r", str(self.framerate),
             *codec_opts,
             "-threads", "2",
@@ -388,11 +389,9 @@ class ConcatEncoder:
         ]
 
         print(f"ConcatEncoder: running ffmpeg with concat demuxer...")
-        ffmpeg = Popen(ffmpeg_cmdline, stdout=PIPE, close_fds=True)
+        ffmpeg = Popen(ffmpeg_cmdline, close_fds=True)
         try:
-            if ffmpeg.stdout is not None:
-                ffmpeg.stdout.close()
-            ffmpeg.wait(timeout=600)
+            ffmpeg.wait()
         except Exception:
             try:
                 ffmpeg.kill()
