@@ -30,7 +30,6 @@ DRAWING_BG = Color.from_int(0xE2E8ED)
 class Codec(Enum):
     H264 = "h264"
     H264_MP4 = "h264_mp4"
-    H264_NVENC = "h264_nvenc"
     VP9 = "vp9"
     RAW_VIDEO = "rawvideo"
 
@@ -138,13 +137,6 @@ class Encoder:
                 "-crf",
                 "20",
             ]
-        elif self.codec == Codec.H264_NVENC:
-            codec_opts = [
-                "-c:v", "h264_nvenc",
-                "-preset", "p4", "-tune", "hq",
-                "-rc", "vbr", "-cq", "20", "-b:v", "0",
-                "-rc-lookahead", "0", "-bf", "0", "-refs", "1",
-            ]
         elif self.codec == Codec.VP9:
             codec_opts = [
                 "-c:v",
@@ -159,8 +151,8 @@ class Encoder:
                 "1",
             ]
 
-        # Use mp4 container for h264_mp4/nvenc output, matroska for everything else
-        if self.codec in (Codec.H264_MP4, Codec.H264_NVENC):
+        # Use mp4 container for h264_mp4 output, matroska for everything else
+        if self.codec == Codec.H264_MP4:
             container_fmt = "mp4"
         else:
             container_fmt = "matroska"
@@ -365,13 +357,6 @@ class ConcatEncoder:
             codec_opts = [
                 "-c:v", "libx264", "-preset", "medium", "-crf", "20",
             ]
-        elif self.codec == Codec.H264_NVENC:
-            codec_opts = [
-                "-c:v", "h264_nvenc",
-                "-preset", "p4", "-tune", "hq",
-                "-rc", "vbr", "-cq", "20", "-b:v", "0",
-                "-rc-lookahead", "0", "-bf", "0", "-refs", "1",
-            ]
         elif self.codec == Codec.VP9:
             codec_opts = [
                 "-c:v", "libvpx-vp9", "-deadline", "realtime",
@@ -380,7 +365,7 @@ class ConcatEncoder:
         else:
             raise ValueError(f"Unsupported codec for ConcatEncoder: {self.codec}")
 
-        if self.codec in (Codec.H264_MP4, Codec.H264_NVENC):
+        if self.codec == Codec.H264_MP4:
             container_fmt = "mp4"
         else:
             container_fmt = "matroska"
