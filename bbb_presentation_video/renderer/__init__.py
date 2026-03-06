@@ -379,11 +379,9 @@ class ConcatEncoder:
             "-safe", "0",
             "-i", concat_file,
             "-pix_fmt", "yuv420p",
-            "-vsync", "cfr",
-            "-r", str(self.framerate),
+            "-vsync", "vfr",
             *codec_opts,
             "-threads", "2",
-            "-g", str(round(self.framerate) * 10),
             "-f", container_fmt,
             self.output,
         ]
