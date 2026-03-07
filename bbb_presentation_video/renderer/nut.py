@@ -51,10 +51,16 @@ _CRC_TABLE = _build_crc32_table()
 
 
 def _crc32(data: bytes | bytearray) -> int:
-    """Compute CRC-32 matching ffmpeg's ff_crc04C11DB7_update with init=0."""
+    """Compute CRC-32 matching ffmpeg's av_crc(AV_CRC_32_IEEE) with init=0.
+
+    FFmpeg uses a non-reflected table (polynomial 0x04C11DB7) but with
+    a reflected computation (LSB lookup, right shift). This hybrid
+    approach means CRC(data || CRC_LE32(data)) == 0, which is how
+    ffmpeg's NUT demuxer validates checksums.
+    """
     crc = 0
     for b in data:
-        crc = (_CRC_TABLE[((crc >> 24) ^ b) & 0xFF] ^ (crc << 8)) & 0xFFFFFFFF
+        crc = (_CRC_TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)) & 0xFFFFFFFF
     return crc
 
 
