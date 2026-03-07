@@ -4,11 +4,10 @@
 
 import threading
 import time
-from enum import Enum
 from fractions import Fraction
 from queue import Queue
 from subprocess import PIPE, CalledProcessError, Popen
-from typing import Optional, cast
+from typing import Optional, Tuple, cast
 
 import cairo
 
@@ -16,79 +15,55 @@ from bbb_presentation_video import events
 from bbb_presentation_video.events import EventsInfo, PerPodEvent, RecordEvent
 from bbb_presentation_video.events.helpers import Color, Size
 from bbb_presentation_video.renderer.cursor import CursorRenderer
+from bbb_presentation_video.renderer.nut import NutMuxer
 from bbb_presentation_video.renderer.presentation import PresentationRenderer
 from bbb_presentation_video.renderer.tldraw import TldrawRenderer
 from bbb_presentation_video.renderer.whiteboard import ShapesRenderer
 
 DRAWING_BG = Color.from_int(0xE2E8ED)
 
-
-class Codec(Enum):
-    H264 = "h264"
-    VP9 = "vp9"
-    RAW_VIDEO = "rawvideo"
+# Timebase for VFR output: 1ms precision
+TIMEBASE_DEN = 1000
 
 
 class Encoder:
-    queue: "Queue[Optional[bytearray]]"
+    """Encodes VFR raw BGR0 frames to H.264/MP4 via NUT muxer piped to ffmpeg."""
+
+    queue: "Queue[Optional[Tuple[bytearray, int]]]"
     ret_queue: "Queue[bytearray]"
 
-    def __init__(
-        self, output: str, width: int, height: int, framerate: Fraction, codec: Codec
-    ):
+    def __init__(self, output: str, width: int, height: int) -> None:
         self.output = output
         self.width = width
         self.height = height
-        self.framerate = framerate
-        self.codec = codec
 
-        self.queue = Queue()
-        self.ret_queue = Queue()
-        for x in range(0, 3):
+        self.queue: Queue[Optional[Tuple[bytearray, int]]] = Queue()
+        self.ret_queue: Queue[bytearray] = Queue()
+        for _ in range(3):
             self.ret_queue.put(bytearray(width * height * 4))
 
         self.thread = threading.Thread(target=self.run)
         self.thread.daemon = True
         self.thread.start()
 
-    def put(self, data: bytearray) -> None:
+    def put(self, data: bytearray, pts_ms: int) -> None:
+        """Queue a frame for encoding.
+
+        Args:
+            data: Raw BGR0 frame data
+            pts_ms: Presentation timestamp in milliseconds
+        """
         buf = self.ret_queue.get()
         buf[:] = data
-        self.queue.put(buf)
+        self.queue.put((buf, pts_ms))
 
     def join(self) -> None:
-        # This is a sentinal value to tell the writing thread to exit
+        # Sentinel value to tell the writing thread to exit
         self.queue.put(None)
         self.thread.join()
 
-    def output_raw(self) -> None:
-        with open(self.output, "wb") as f:
-            while True:
-                buf = self.queue.get()
-                if buf is None:
-                    break
-                f.write(buf)
-                self.ret_queue.put(buf)
-
-    def output_ffmpeg(self) -> None:
-        if self.codec == Codec.H264:
-            codec_opts = ["-c:v", "libx264", "-qp", "0", "-preset", "ultrafast"]
-        elif self.codec == Codec.VP9:
-            codec_opts = [
-                "-c:v",
-                "libvpx-vp9",
-                "-deadline",
-                "realtime",
-                "-cpu-used",
-                "8",
-                "-lossless",
-                "1",
-                "-row-mt",
-                "1",
-            ]
-        # Launch the video encoder
-        # Note that the hardcoded 'bgr0' here is only applicable in
-        # little-endian!
+    def run(self) -> None:
+        """Pipe VFR NUT stream to ffmpeg for H.264/MP4 encoding."""
         ffmpeg_cmdline = [
             "ffmpeg",
             "-y",
@@ -96,26 +71,27 @@ class Encoder:
             "-v",
             "warning",
             "-f",
-            "rawvideo",
-            "-pixel_format",
-            "bgr0",
-            "-video_size",
-            f"{self.width:d}x{self.height:d}",
-            "-framerate",
-            str(self.framerate),
+            "nut",
             "-i",
             "-",
             "-pix_fmt",
             "yuv420p",
-            "-vf",
-            f"mpdecimate=max={int(round(self.framerate)):d}:hi=1:lo=1:frac=1",
-            *codec_opts,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-bf",
+            "0",
+            "-fps_mode",
+            "vfr",
             "-threads",
-            "2",
-            "-g",
-            str(round(self.framerate) * 10),
+            "0",
+            "-movflags",
+            "+faststart",
             "-f",
-            "matroska",
+            "mp4",
             self.output,
         ]
 
@@ -123,26 +99,24 @@ class Encoder:
         assert ffmpeg.stdout is not None and ffmpeg.stdin is not None
         ffmpeg.stdout.close()
 
+        muxer = NutMuxer(ffmpeg.stdin, self.width, self.height, 1, TIMEBASE_DEN)
+        muxer.write_headers()
+
         while True:
-            buf = self.queue.get()
-            if buf is None:
+            item = self.queue.get()
+            if item is None:
                 break
 
-            ffmpeg.stdin.write(buf)
-
+            buf, pts_ms = item
+            muxer.write_frame(bytes(buf), pts_ms)
             self.ret_queue.put(buf)
 
+        muxer.close()
         ffmpeg.stdin.close()
         ffmpeg.wait()
 
         if ffmpeg.returncode != 0:
             raise CalledProcessError(returncode=ffmpeg.returncode, cmd=ffmpeg_cmdline)
-
-    def run(self) -> None:
-        if self.codec == Codec.RAW_VIDEO:
-            self.output_raw()
-        else:
-            self.output_ffmpeg()
 
 
 class Renderer:
@@ -154,7 +128,6 @@ class Renderer:
     width: int
     height: int
     framerate: Fraction
-    codec: Codec
     pod_id: str
     ignore_record_status: bool
 
@@ -171,7 +144,6 @@ class Renderer:
         width: int,
         height: int,
         framerate: Fraction,
-        codec: Codec,
         start_time: Fraction | None,
         end_time: Fraction | None,
         pod_id: str,
@@ -183,7 +155,6 @@ class Renderer:
         self.width = width
         self.height = height
         self.framerate = framerate
-        self.codec = codec
         self.pod_id = pod_id
         self.ignore_record_status = ignore_record_status
 
@@ -247,14 +218,13 @@ class Renderer:
             self.ctx, presentation.transform, self.events.bbb_version
         )
 
-        encoder = Encoder(
-            self.output, self.width, self.height, self.framerate, self.codec
-        )
+        encoder = Encoder(self.output, self.width, self.height)
 
         presentation_changed = True
         shapes_changed = False
         cursor_changed = False
         recording_changed = False
+        first_frame = True
         while self.pts < self.length:
             event_ts = Fraction(0)
             while True:
@@ -359,14 +329,17 @@ class Renderer:
 
                 self.surface.flush()
 
-                if recording_changed:
+                if recording_changed or first_frame:
                     end_time = time.perf_counter_ns()
                     print(
                         f"-- {float(self.pts):012.6f} frame {self.frame} ({(end_time - start_time) / 1000000:.3f}ms)"
                     )
 
-                # Output a frame
-                encoder.put(bytearray(self.surface.get_data()))
+                    # Output frame with VFR timestamp (only when content changed)
+                    # PTS is relative to start_time so output video starts at 0
+                    pts_ms = int((self.pts - self.start_time) * TIMEBASE_DEN)
+                    encoder.put(bytearray(self.surface.get_data()), pts_ms)
+                    first_frame = False
 
                 presentation_changed = False
                 shapes_changed = False
@@ -375,5 +348,9 @@ class Renderer:
 
             self.frame += 1
             self.pts += self.framestep
+
+        # Output a final frame at the end timestamp to set correct video duration
+        end_pts_ms = int((self.length - self.start_time) * TIMEBASE_DEN)
+        encoder.put(bytearray(self.surface.get_data()), end_pts_ms)
 
         encoder.join()

@@ -12,13 +12,13 @@ from typing import IO, Any, cast
 __all__ = ["events", "renderer"]
 
 from bbb_presentation_video.events import DEFAULT_PRESENTATION_POD, parse_events
-from bbb_presentation_video.renderer import Codec, Renderer
+from bbb_presentation_video.renderer import Renderer
 
 DEFAULT_WIDTH = 960
 DEFAULT_HEIGHT = 720
 DEFAULT_RATE = Fraction("24000/1000")
 DEFAULT_INPUT = "."
-DEFAULT_OUTPUT = "presentation.mkv"
+DEFAULT_OUTPUT = "presentation.mp4"
 
 
 def main() -> None:
@@ -61,19 +61,19 @@ def main() -> None:
         default=DEFAULT_HEIGHT,
     )
     parser.add_argument(
-        "-c",
-        "--codec",
-        metavar="CODEC",
-        type=Codec,
-        help="output file video codec (default: %(default)s)",
-        default="vp9",
+        "--format",
+        metavar="FORMAT",
+        type=str,
+        choices=["h264"],
+        help="output video format (default: %(default)s)",
+        default="h264",
     )
     parser.add_argument(
         "-r",
         "--framerate",
         metavar="RATE",
         type=Fraction,
-        help="video framerate (default: %(default)s)",
+        help="video framerate for change detection (default: %(default)s)",
         default=DEFAULT_RATE,
     )
     parser.add_argument(
@@ -133,7 +133,7 @@ def main() -> None:
 
     print(f'Using recording data from "{args.input}"')
     print(
-        f"Video size is {args.width}x{args.height}, framerate {args.framerate}, codec {args.codec.value}"
+        f"Video size is {args.width}x{args.height}, framerate {args.framerate}, format {args.format}"
     )
     print(f'Outputting video to "{args.output}"')
 
@@ -161,7 +161,6 @@ def main() -> None:
         args.width,
         args.height,
         args.framerate,
-        args.codec,
         args.start,
         args.end,
         args.pod,
