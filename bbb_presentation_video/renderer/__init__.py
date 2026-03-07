@@ -8,7 +8,7 @@ from enum import Enum
 from fractions import Fraction
 from queue import Empty, Queue
 from subprocess import PIPE, CalledProcessError, Popen
-from typing import Optional, cast
+from typing import Optional, Union, cast
 
 import cairo
 
@@ -16,6 +16,7 @@ from bbb_presentation_video import events
 from bbb_presentation_video.events import EventsInfo, PerPodEvent, RecordEvent
 from bbb_presentation_video.events.helpers import Color, Size
 from bbb_presentation_video.renderer.cursor import CursorRenderer
+from bbb_presentation_video.renderer.nut import NutMuxer
 from bbb_presentation_video.renderer.presentation import PresentationRenderer
 from bbb_presentation_video.renderer.tldraw import TldrawRenderer
 from bbb_presentation_video.renderer.whiteboard import ShapesRenderer
@@ -231,6 +232,169 @@ class Encoder:
             print(f"ERROR: Encoder thread failed: {e}")
 
 
+class VfrEncoder:
+    """Encoder using NUT muxer for variable frame rate output.
+
+    Only changed frames are piped to ffmpeg with correct VFR timestamps,
+    eliminating duplicate frame processing entirely.
+    """
+
+    queue: "Queue[Optional[tuple[int, bytearray]]]"
+    ret_queue: "Queue[bytearray]"
+
+    def __init__(
+        self, output: str, width: int, height: int, framerate: Fraction, codec: Codec
+    ):
+        self.output = output
+        self.width = width
+        self.height = height
+        self.framerate = framerate
+        self.codec = codec
+
+        self.queue: Queue[Optional[tuple[int, bytearray]]] = Queue()
+        self.ret_queue: Queue[bytearray] = Queue()
+        for _ in range(3):
+            self.ret_queue.put(bytearray(width * height * 4))
+
+        self.error: Optional[BaseException] = None
+        self.ffmpeg_process: Optional[Popen] = None
+
+        self.thread = threading.Thread(target=self.run)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def put(self, data: bytearray, pts: int) -> None:
+        """Queue a frame for encoding at the given PTS."""
+        while True:
+            if self.error is not None:
+                raise EncoderError(
+                    f"Encoder thread failed: {self.error}"
+                ) from self.error
+            if not self.thread.is_alive():
+                raise EncoderError(
+                    "Encoder thread exited unexpectedly"
+                    + (f": {self.error}" if self.error else "")
+                )
+            try:
+                buf = self.ret_queue.get(timeout=2)
+                break
+            except Empty:
+                continue
+        buf[:] = data
+        self.queue.put((pts, buf))
+
+    def join(self) -> None:
+        self.queue.put(None)
+        self.thread.join(timeout=120)
+        if self.thread.is_alive():
+            print("WARNING: VfrEncoder thread did not exit within timeout, killing ffmpeg")
+            self._kill_ffmpeg()
+            self.thread.join(timeout=10)
+        if self.error is not None:
+            raise EncoderError(
+                f"Encoder thread failed: {self.error}"
+            ) from self.error
+
+    def cancel(self) -> None:
+        """Cancel encoding: drain queues, signal thread to stop, kill ffmpeg."""
+        self.queue.put(None)
+        self._kill_ffmpeg()
+        self.thread.join(timeout=10)
+
+    def _kill_ffmpeg(self) -> None:
+        if self.ffmpeg_process is not None:
+            try:
+                self.ffmpeg_process.kill()
+            except OSError:
+                pass
+
+    def run(self) -> None:
+        try:
+            self._output_ffmpeg()
+        except Exception as e:
+            self.error = e
+            print(f"ERROR: VfrEncoder thread failed: {e}")
+
+    def _output_ffmpeg(self) -> None:
+        if self.codec == Codec.H264_MP4:
+            codec_opts = [
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "20",
+            ]
+            container_fmt = "mp4"
+        elif self.codec == Codec.H264:
+            codec_opts = ["-c:v", "libx264", "-qp", "0", "-preset", "ultrafast"]
+            container_fmt = "matroska"
+        else:
+            codec_opts = [
+                "-c:v", "libvpx-vp9",
+                "-deadline", "realtime",
+                "-cpu-used", "8",
+                "-lossless", "1",
+                "-row-mt", "1",
+            ]
+            container_fmt = "matroska"
+
+        ffmpeg_cmdline = [
+            "ffmpeg",
+            "-y",
+            "-nostats",
+            "-v", "warning",
+            "-f", "nut",
+            "-i", "pipe:0",
+            "-pix_fmt", "yuv420p",
+            *codec_opts,
+            "-vsync", "vfr",
+            "-threads", "2",
+            "-movflags", "+faststart",
+            "-f", container_fmt,
+            self.output,
+        ]
+
+        ffmpeg = Popen(ffmpeg_cmdline, stdin=PIPE, stdout=PIPE, close_fds=True)
+        self.ffmpeg_process = ffmpeg
+        assert ffmpeg.stdout is not None and ffmpeg.stdin is not None
+        ffmpeg.stdout.close()
+
+        # Use framerate denominator/numerator as time base so PTS units
+        # correspond exactly to frame ticks (1 PTS unit = 1 frame period)
+        time_base_num = self.framerate.denominator
+        time_base_den = self.framerate.numerator
+        muxer = NutMuxer(
+            ffmpeg.stdin, self.width, self.height,
+            time_base_num, time_base_den,
+        )
+
+        try:
+            while True:
+                item = self.queue.get()
+                if item is None:
+                    break
+
+                pts, buf = item
+                muxer.write_frame(pts, buf)
+                self.ret_queue.put(buf)
+        except BrokenPipeError:
+            while True:
+                item = self.queue.get()
+                if item is None:
+                    break
+                _, buf = item
+                self.ret_queue.put(buf)
+            raise
+        finally:
+            try:
+                ffmpeg.stdin.close()
+            except BrokenPipeError:
+                pass
+
+        ffmpeg.wait(timeout=120)
+
+        if ffmpeg.returncode != 0:
+            raise CalledProcessError(returncode=ffmpeg.returncode, cmd=ffmpeg_cmdline)
+
+
 class Renderer:
     events: EventsInfo
     start_time: Fraction = Fraction(0)
@@ -333,15 +497,24 @@ class Renderer:
             self.ctx, presentation.transform, self.events.bbb_version
         )
 
-        encoder = Encoder(
-            self.output, self.width, self.height, self.framerate, self.codec
-        )
+        use_vfr = self.codec == Codec.H264_MP4
+        encoder: Union[Encoder, VfrEncoder]
+        if use_vfr:
+            encoder = VfrEncoder(
+                self.output, self.width, self.height, self.framerate, self.codec
+            )
+        else:
+            encoder = Encoder(
+                self.output, self.width, self.height, self.framerate, self.codec
+            )
 
         try:
             presentation_changed = True
             shapes_changed = False
             cursor_changed = False
             recording_changed = False
+            # PTS counter for VFR encoder (in frame tick units)
+            pts_counter = 0
             while self.pts < self.length:
                 event_ts = Fraction(0)
                 while True:
@@ -419,12 +592,14 @@ class Renderer:
                     tldraw_changed = tldraw.finalize_frame(presentation.transform)
                     cursor_changed = cursor.finalize_frame(presentation.transform)
 
-                    if (
+                    frame_changed = (
                         presentation_changed
                         or shapes_changed
                         or tldraw_changed
                         or cursor_changed
-                    ):
+                    )
+
+                    if frame_changed:
                         # Composite the frame
 
                         # Base background color
@@ -454,13 +629,24 @@ class Renderer:
                             f"-- {float(self.pts):012.6f} frame {self.frame} ({(end_time - start_time) / 1000000:.3f}ms)"
                         )
 
-                    # Output a frame
-                    encoder.put(bytearray(self.surface.get_data()))
+                    # Output frame(s) to encoder
+                    if use_vfr:
+                        # VFR: only pipe changed frames with their PTS
+                        if frame_changed or recording_changed:
+                            assert isinstance(encoder, VfrEncoder)
+                            encoder.put(
+                                bytearray(self.surface.get_data()), pts_counter
+                            )
+                    else:
+                        # CFR: pipe every frame (mpdecimate handles dedup)
+                        assert isinstance(encoder, Encoder)
+                        encoder.put(bytearray(self.surface.get_data()))
 
                     presentation_changed = False
                     shapes_changed = False
                     cursor_changed = False
                     recording_changed = False
+                    pts_counter += 1
 
                 self.frame += 1
                 self.pts += self.framestep
