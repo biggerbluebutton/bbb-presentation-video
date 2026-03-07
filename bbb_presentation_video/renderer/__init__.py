@@ -9,6 +9,9 @@ from queue import Queue
 from subprocess import PIPE, CalledProcessError, Popen
 from typing import Optional, Tuple, cast
 
+# Cursor-only frames are throttled to this interval to reduce encoder load
+CURSOR_ONLY_INTERVAL = Fraction(1, 4)  # 4fps max for cursor-only changes
+
 import cairo
 
 from bbb_presentation_video import events
@@ -225,6 +228,11 @@ class Renderer:
         cursor_changed = False
         recording_changed = False
         first_frame = True
+        # Cached background (presentation + shapes + tldraw, without cursor)
+        bg_data: Optional[bytearray] = None
+        # Throttle cursor-only frame output
+        last_cursor_only_pts = Fraction(-1)
+
         while self.pts < self.length:
             event_ts = Fraction(0)
             while True:
@@ -300,46 +308,64 @@ class Renderer:
                 tldraw_changed = tldraw.finalize_frame(presentation.transform)
                 cursor_changed = cursor.finalize_frame(presentation.transform)
 
-                if (
-                    presentation_changed
-                    or shapes_changed
-                    or tldraw_changed
-                    or cursor_changed
-                ):
-                    # Composite the frame
+                bg_changed = (
+                    presentation_changed or shapes_changed or tldraw_changed
+                )
 
-                    # Base background color
+                if bg_changed or cursor_changed:
                     ctx = self.ctx
-                    ctx.save()
-                    ctx.set_source_rgb(*DRAWING_BG)
-                    ctx.paint()
-                    ctx.restore()
 
-                    # Presentation
-                    presentation.render()
+                    if bg_changed:
+                        # Repaint background layers to main surface
+                        ctx.save()
+                        ctx.set_source_rgb(*DRAWING_BG)
+                        ctx.paint()
+                        ctx.restore()
 
-                    # Shapes
-                    shapes.render()
-                    tldraw.render()
+                        presentation.render()
+                        shapes.render()
+                        tldraw.render()
 
-                    # Cursor
+                        # Snapshot the background for cursor-only redraws
+                        self.surface.flush()
+                        bg_data = bytearray(self.surface.get_data())
+                    elif bg_data is not None:
+                        # Restore background from snapshot (cursor-only change)
+                        buf = memoryview(self.surface.get_data())
+                        buf[:] = bg_data
+                        self.surface.mark_dirty()
+
+                    # Add cursor on top
                     cursor.render()
 
                     recording_changed = True
 
-                self.surface.flush()
-
                 if recording_changed or first_frame:
-                    end_time = time.perf_counter_ns()
-                    print(
-                        f"-- {float(self.pts):012.6f} frame {self.frame} ({(end_time - start_time) / 1000000:.3f}ms)"
-                    )
+                    # Throttle cursor-only frames to reduce encoder load
+                    cursor_only = cursor_changed and not bg_changed
+                    if (
+                        cursor_only
+                        and not first_frame
+                        and (self.pts - last_cursor_only_pts)
+                        < CURSOR_ONLY_INTERVAL
+                    ):
+                        # Skip this cursor-only frame (too soon)
+                        recording_changed = False
+                    else:
+                        self.surface.flush()
 
-                    # Output frame with VFR timestamp (only when content changed)
-                    # PTS is relative to start_time so output video starts at 0
-                    pts_ms = int((self.pts - self.start_time) * TIMEBASE_DEN)
-                    encoder.put(bytearray(self.surface.get_data()), pts_ms)
-                    first_frame = False
+                        end_time = time.perf_counter_ns()
+                        print(
+                            f"-- {float(self.pts):012.6f} frame {self.frame} ({(end_time - start_time) / 1000000:.3f}ms)"
+                        )
+
+                        # Output frame with VFR timestamp
+                        pts_ms = int((self.pts - self.start_time) * TIMEBASE_DEN)
+                        encoder.put(bytearray(self.surface.get_data()), pts_ms)
+                        first_frame = False
+
+                        if cursor_only:
+                            last_cursor_only_pts = self.pts
 
                 presentation_changed = False
                 shapes_changed = False

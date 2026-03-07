@@ -68,6 +68,7 @@ class ShapesRenderer(Generic[CairoSomeSurface]):
         self.transform = transform
 
         self.pattern = None
+        self.shape_patterns: Dict[str, cairo.Pattern] = {}
 
         self.shapes_changed = False
 
@@ -77,6 +78,7 @@ class ShapesRenderer(Generic[CairoSomeSurface]):
             return
         self.presentation = event["presentation"]
         self.shapes_changed = True
+        self.shape_patterns.clear()
         # Restore the last viewed page from this presentation
         self.slide = self.presentation_slide.get(self.presentation, 0)
         print(f"\tShapes: presentation: {self.presentation}")
@@ -90,6 +92,7 @@ class ShapesRenderer(Generic[CairoSomeSurface]):
         if self.presentation is not None:
             self.presentation_slide[self.presentation] = self.slide
         self.shapes_changed = True
+        self.shape_patterns.clear()
         print(f"\tShapes: slide: {self.slide}")
 
     def ensure_shapes_structure(self, presentation: str, slide: int) -> None:
@@ -167,6 +170,8 @@ class ShapesRenderer(Generic[CairoSomeSurface]):
             f"presentation: {presentation} slide: {slide} points: {event['points']}"
         )
         self.shapes_changed = True
+        if event["shape_id"] is not None:
+            self.shape_patterns.pop(event["shape_id"], None)
 
     def update_undo(self, event: UndoEvent) -> None:
         presentation = event.get("presentation", self.presentation)
@@ -189,6 +194,7 @@ class ShapesRenderer(Generic[CairoSomeSurface]):
                 ]
             )
             self.shapes_changed = True
+            self.shape_patterns.pop(shape_id, None)
             print(f"\tShapes: undo removed id: {shape_id}")
 
         # Undo without a shape id just removes the most recently added shape
@@ -196,6 +202,8 @@ class ShapesRenderer(Generic[CairoSomeSurface]):
             if len(self.shapes[presentation][slide]) > 0:
                 shape = self.shapes[presentation][slide].pop()
                 self.shapes_changed = True
+                if shape["shape_id"] is not None:
+                    self.shape_patterns.pop(shape["shape_id"], None)
                 print(
                     f"\tShapes: undo removed last added shape, id: {shape['shape_id']}"
                 )
@@ -215,10 +223,16 @@ class ShapesRenderer(Generic[CairoSomeSurface]):
         if event.get("full_clear", True):
             self.shapes[presentation][slide] = deque()
             self.shapes_changed = True
+            self.shape_patterns.clear()
             print("\tShapes: cleared all shapes")
 
         # Otherwise we have to remove only shapes for a specific user
         else:
+            removed = [
+                x
+                for x in self.shapes[presentation][slide]
+                if x["user_id"] == event["user_id"]
+            ]
             self.shapes[presentation][slide] = deque(
                 [
                     x
@@ -226,6 +240,9 @@ class ShapesRenderer(Generic[CairoSomeSurface]):
                     if x["user_id"] != event["user_id"]
                 ]
             )
+            for x in removed:
+                if x["shape_id"] is not None:
+                    self.shape_patterns.pop(x["shape_id"], None)
             self.shapes_changed = True
             print(f"\tShapes: cleared shapes for user {event['user_id']}")
 
@@ -594,11 +611,37 @@ class ShapesRenderer(Generic[CairoSomeSurface]):
                 ctx.set_source_rgb(*POLL_FG)
                 PangoCairo.show_layout(ctx, layout)
 
+    def _draw_shape(self, shape: ShapeEvent) -> None:
+        """Draw a single shape to the current cairo context."""
+        type = shape["shape_type"]
+        if type == "pencil":
+            self.draw_pencil(shape)
+        elif type == "rectangle":
+            self.draw_rectangle(shape)
+        elif type == "ellipse":
+            self.draw_ellipse(shape)
+        elif type == "triangle":
+            self.draw_triangle(shape)
+        elif type == "line":
+            self.draw_line(shape)
+        elif type == "text":
+            self.draw_text(shape)
+        elif type == "poll_result":
+            self.draw_poll_result(shape)
+        else:
+            print(f"\tShapes: don't know how to draw {type}")
+
     def finalize_frame(self, transform: Transform) -> bool:
         try:
             if not self.shapes_changed and self.transform == transform:
                 return False
+
+            transform_changed = self.transform != transform
             self.transform = transform
+
+            # Clear all shape caches on transform change
+            if transform_changed:
+                self.shape_patterns.clear()
 
             if (
                 self.presentation is None
@@ -612,34 +655,37 @@ class ShapesRenderer(Generic[CairoSomeSurface]):
                 else:
                     return False
 
+            shapes_list = self.shapes[self.presentation][self.slide]
+            cached = sum(
+                1
+                for s in shapes_list
+                if s["shape_id"] is not None and s["shape_id"] in self.shape_patterns
+            )
             print(
-                f"\tShapes: rendering {len(self.shapes[self.presentation][self.slide])} shapes"
+                f"\tShapes: rendering {len(shapes_list)} shapes ({cached} cached)"
             )
 
             ctx = self.ctx
             ctx.push_group()
             apply_shapes_transform(ctx, self.transform)
 
-            for shape in self.shapes[self.presentation][self.slide]:
-                ctx.save()
-                type = shape["shape_type"]
-                if type == "pencil":
-                    self.draw_pencil(shape)
-                elif type == "rectangle":
-                    self.draw_rectangle(shape)
-                elif type == "ellipse":
-                    self.draw_ellipse(shape)
-                elif type == "triangle":
-                    self.draw_triangle(shape)
-                elif type == "line":
-                    self.draw_line(shape)
-                elif type == "text":
-                    self.draw_text(shape)
-                elif type == "poll_result":
-                    self.draw_poll_result(shape)
+            for shape in shapes_list:
+                shape_id = shape["shape_id"]
+                if shape_id is not None and shape_id in self.shape_patterns:
+                    # Use cached pattern for this shape
+                    ctx.set_source(self.shape_patterns[shape_id])
+                    ctx.paint()
                 else:
-                    print(f"\tShapes: don't know how to draw {type}")
-                ctx.restore()
+                    # Render shape and cache it
+                    ctx.push_group()
+                    ctx.save()
+                    self._draw_shape(shape)
+                    ctx.restore()
+                    pattern = ctx.pop_group()
+                    if shape_id is not None:
+                        self.shape_patterns[shape_id] = pattern
+                    ctx.set_source(pattern)
+                    ctx.paint()
 
             self.pattern = ctx.pop_group()
 
