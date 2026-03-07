@@ -367,6 +367,7 @@ class GeoShape(Enum):
     OVAL = "oval"
     RECTANGLE = "rectangle"
     RHOMBUS = "rhombus"
+    RHOMBUS_2 = "rhombus-2"
     STAR = "star"
     TRAPEZOID = "trapezoid"
     TRIANGLE = "triangle"

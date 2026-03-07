@@ -343,6 +343,12 @@ class RhombusGeoShape(GeoShapeProto):
 
 
 @attr.s(order=False, slots=True, auto_attribs=True)
+class Rhombus2GeoShape(GeoShapeProto):
+    # SizedShapeProto
+    size: Size = Size(1.0, 1.0)
+
+
+@attr.s(order=False, slots=True, auto_attribs=True)
 class HexagonGeoShape(GeoShapeProto):
     # SizedShapeProto
     size: Size = Size(1.0, 1.0)
@@ -705,6 +711,8 @@ def parse_shape_from_data(data: ShapeData, bbb_version: Version) -> Optional[Sha
                 return TrapezoidGeoShape.from_data(data)
             if geo_type is GeoShape.RHOMBUS:
                 return RhombusGeoShape.from_data(data)
+            if geo_type is GeoShape.RHOMBUS_2:
+                return Rhombus2GeoShape.from_data(data)
             if geo_type is GeoShape.HEXAGON:
                 return HexagonGeoShape.from_data(data)
             if geo_type is GeoShape.CLOUD:
