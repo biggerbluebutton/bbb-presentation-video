@@ -31,15 +31,18 @@ _FRAME_CODE = 0x01
 
 
 def _build_crc32_table() -> list[int]:
-    """Build CRC-32 IEEE LE lookup table (polynomial 0xEDB88320, init=0)."""
+    """Build CRC-32 IEEE lookup table (non-reflected polynomial 0x04C11DB7).
+
+    This matches ffmpeg's ff_crc04C11DB7_update / AV_CRC_32_IEEE.
+    """
     table = []
     for i in range(256):
-        crc = i
+        crc = i << 24
         for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0xEDB88320
+            if crc & 0x80000000:
+                crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF
             else:
-                crc >>= 1
+                crc = (crc << 1) & 0xFFFFFFFF
         table.append(crc)
     return table
 
@@ -48,10 +51,10 @@ _CRC_TABLE = _build_crc32_table()
 
 
 def _crc32(data: bytes | bytearray) -> int:
-    """Compute CRC-32 matching ffmpeg's AV_CRC_32_IEEE_LE with init=0."""
+    """Compute CRC-32 matching ffmpeg's ff_crc04C11DB7_update with init=0."""
     crc = 0
     for b in data:
-        crc = _CRC_TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
+        crc = (_CRC_TABLE[((crc >> 24) ^ b) & 0xFF] ^ (crc << 8)) & 0xFFFFFFFF
     return crc
 
 
@@ -90,14 +93,17 @@ def _encode_vb(data: bytes) -> bytes:
 
 
 def _build_packet(startcode: int, content: bytes) -> bytes:
-    """Build a complete NUT packet with startcode, forward_ptr, and CRC."""
+    """Build a complete NUT packet with startcode, forward_ptr, and CRC.
+
+    Matches ffmpeg's put_packet(): CRC covers content bytes only,
+    not startcode or forward_ptr.
+    """
     forward_ptr = len(content) + 4  # content + checksum
     startcode_bytes = struct.pack(">Q", startcode)
     forward_ptr_bytes = _encode_v(forward_ptr)
-    # CRC covers everything from startcode through content
-    crc_input = startcode_bytes + forward_ptr_bytes + content
-    checksum = _crc32(crc_input)
-    return crc_input + struct.pack("<I", checksum)
+    # CRC covers content only (matching ffmpeg's nutenc.c put_packet)
+    checksum = _crc32(content)
+    return startcode_bytes + forward_ptr_bytes + content + struct.pack("<I", checksum)
 
 
 class NutMuxer:
