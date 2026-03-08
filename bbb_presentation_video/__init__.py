@@ -120,6 +120,21 @@ def main() -> None:
         help="ignore recording start/stop events and generate video for the entire meeting",
         default=False,
     )
+    parser.add_argument(
+        "-j",
+        "--workers",
+        metavar="N",
+        type=int,
+        help="number of parallel worker processes (default: %(default)s, sequential)",
+        default=1,
+    )
+    parser.add_argument(
+        "--ffmpeg-threads",
+        metavar="N",
+        type=int,
+        help="ffmpeg encoder threads per worker in parallel mode (default: %(default)s)",
+        default=1,
+    )
 
     args = parser.parse_args()
 
@@ -153,21 +168,38 @@ def main() -> None:
     if args.end is not None:
         print(f"Recording section ending at {args.end} seconds")
 
-    print("Rendering output video...")
-    renderer = Renderer(
-        events,
-        args.input,
-        args.output,
-        args.width,
-        args.height,
-        args.framerate,
-        args.start,
-        args.end,
-        args.pod,
-        args.ignore_record_status,
-    )
+    if args.workers > 1:
+        from bbb_presentation_video.parallel import render_parallel
 
-    renderer.render()
+        print(f"Rendering output video with {args.workers} parallel workers...")
+        render_parallel(
+            input_dir=args.input,
+            output=args.output,
+            width=args.width,
+            height=args.height,
+            framerate=args.framerate,
+            start_time=args.start,
+            end_time=args.end if args.end is not None else events.length,
+            pod_id=args.pod,
+            ignore_record_status=args.ignore_record_status,
+            num_workers=args.workers,
+            ffmpeg_threads=args.ffmpeg_threads,
+        )
+    else:
+        print("Rendering output video...")
+        renderer = Renderer(
+            events,
+            args.input,
+            args.output,
+            args.width,
+            args.height,
+            args.framerate,
+            args.start,
+            args.end,
+            args.pod,
+            args.ignore_record_status,
+        )
+        renderer.render()
 
 
 if __name__ == "__main__":
