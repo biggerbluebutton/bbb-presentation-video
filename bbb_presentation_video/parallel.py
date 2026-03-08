@@ -115,6 +115,19 @@ def render_parallel(
     if total_duration <= 0:
         raise ValueError(f"Invalid time range: {float(effective_start):.3f}s - {float(effective_end):.3f}s")
 
+    # Cap worker count so each chunk is at least MIN_CHUNK_SECONDS long.
+    # Very short chunks waste time on process spawn, event parsing, and
+    # ffmpeg startup overhead.
+    MIN_CHUNK_SECONDS = 5
+    max_useful_workers = max(1, int(total_duration / MIN_CHUNK_SECONDS))
+    if num_workers > max_useful_workers:
+        print(
+            f"Video is {float(total_duration):.1f}s — capping workers "
+            f"from {num_workers} to {max_useful_workers} "
+            f"(min {MIN_CHUNK_SECONDS}s per chunk)"
+        )
+        num_workers = max_useful_workers
+
     # Compute chunk boundaries
     chunk_duration = total_duration / num_workers
     chunks = []
