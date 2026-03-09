@@ -90,7 +90,7 @@ class Encoder:
             "-bf",
             "0",
             "-fps_mode",
-            "vfr",
+            "cfr",
             "-r",
             str(float(self.framerate)),
             "-color_primaries",
