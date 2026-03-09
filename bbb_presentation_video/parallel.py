@@ -115,14 +115,14 @@ def render_parallel(
     if total_duration <= 0:
         raise ValueError(f"Invalid time range: {float(effective_start):.3f}s - {float(effective_end):.3f}s")
 
-    # Cap worker count: at least 60 seconds per chunk.
-    # Formula: max_workers = int(duration / 60) + 1
-    max_useful_workers = int(total_duration / 60) + 1
+    # Cap worker count: at least 30 seconds per chunk.
+    # Formula: max_workers = int(duration / 30) + 1
+    max_useful_workers = int(total_duration / 30) + 1
     if num_workers > max_useful_workers:
         print(
             f"Video is {float(total_duration):.1f}s — capping workers "
             f"from {num_workers} to {max_useful_workers} "
-            f"(~60s per chunk)"
+            f"(~30s per chunk)"
         )
         num_workers = max_useful_workers
 
