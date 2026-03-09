@@ -35,10 +35,11 @@ class Encoder:
     queue: "Queue[Optional[Tuple[bytearray, int]]]"
     ret_queue: "Queue[bytearray]"
 
-    def __init__(self, output: str, width: int, height: int, ffmpeg_threads: int = 0) -> None:
+    def __init__(self, output: str, width: int, height: int, framerate: Fraction = Fraction(24), ffmpeg_threads: int = 0) -> None:
         self.output = output
         self.width = width
         self.height = height
+        self.framerate = framerate
         self.ffmpeg_threads = ffmpeg_threads
 
         self.queue: Queue[Optional[Tuple[bytearray, int]]] = Queue()
@@ -90,6 +91,14 @@ class Encoder:
             "0",
             "-fps_mode",
             "vfr",
+            "-r",
+            str(float(self.framerate)),
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
             "-threads",
             str(self.ffmpeg_threads),
             "-movflags",
@@ -224,7 +233,7 @@ class Renderer:
             self.ctx, presentation.transform, self.events.bbb_version
         )
 
-        encoder = Encoder(self.output, self.width, self.height, self.ffmpeg_threads)
+        encoder = Encoder(self.output, self.width, self.height, self.framerate, self.ffmpeg_threads)
 
         presentation_changed = True
         shapes_changed = False
